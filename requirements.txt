@@ -1,3 +1,16 @@
-tensorflow>=2.15,<2.17
+# Inference-only deps.  Python 3.9 - 3.12.
+#
+# The floor is 2.16, not 2.15:  TF 2.16 bundles Keras 3, and
+# models/age_gender_custom_cnn_v1.keras was saved with Keras 3.8.
+# TF 2.15 ships Keras 2, which cannot deserialize that file and dies at
+# load_model() with "Could not interpret / unknown layer" style errors.
+tensorflow>=2.16,<2.17
+
+# numpy must stay on 1.x -- TF 2.16 requires numpy>=1.23.5,<2.0.0.
+# Without the ceiling, an env that already has numpy 2.x reports
+# "Requirement already satisfied" and then fails at import time.
+numpy>=1.24,<2
+
+# Use opencv-python-headless instead on GUI-less servers/containers; the
+# regular wheel needs libGL.so.1 at import time even if you never call imshow.
 opencv-python>=4.8
-numpy>=1.24

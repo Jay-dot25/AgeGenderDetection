@@ -1,0 +1,15 @@
+# Normalize line endings so a Windows and a Linux checkout stop fighting over
+# whole-file diffs (realtime_detection.py was CRLF while everything else was LF).
+* text=auto
+
+*.py   text eol=lf
+*.sh   text eol=lf
+*.ipynb text eol=lf
+
+# Never let git try to normalize or diff the binary artifacts.
+*.keras binary
+*.h5    binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.mp4   binary

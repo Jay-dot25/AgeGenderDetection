@@ -70,11 +70,22 @@ models/age_gender_custom_cnn_v1.keras
 
 Input is always **128×128, single-channel grayscale**, raw pixel values in `[0, 255]`. Normalization happens *inside* the model via a `Rescaling(1./255.)` layer — see [Known Issues](#known-issues--lessons-learned) below for why this matters.
 
+## Requirements
+
+| | |
+|---|---|
+| Python | **3.9 – 3.12** (no TensorFlow 2.16 wheel exists for 3.13+) |
+| TensorFlow | `>=2.16,<2.17` — 2.16 bundles **Keras 3**, and the shipped model was saved with Keras 3.8. TF 2.15 (Keras 2) **cannot load it** |
+| numpy | `>=1.24,<2` — TF 2.16 rejects numpy 2.x |
+| Needs a webcam? | Only `realtime_detection.py`. `scripts/predict_image.py` works headless |
+
 ## Setup (First Time)
+
+### macOS / Linux
 
 ```bash
 git clone <your-repo-url>
-cd age-gender-detection
+cd AgeGenderDetection
 
 # Inference-only setup
 bash setup.sh
@@ -83,27 +94,54 @@ bash setup.sh
 bash setup.sh --train
 ```
 
+### Windows (PowerShell)
+
+`setup.sh` is a bash script — skip it and run the four commands it wraps:
+
+```powershell
+git clone <your-repo-url>
+cd AgeGenderDetection
+
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Notes for Windows checkouts:
+
+- Use `py -3.11` / `python`, **not** `python3` (that name is a dead Store alias), and `.\.venv\Scripts\Activate.ps1`, not `source .venv/bin/activate`.
+- If activation is blocked: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`.
+- Prefer a folder **outside OneDrive** — Files On-Demand keeps the 59 MB `models/*.keras` as a remote placeholder and it can read as missing.
+
 ## Running
 
 ```bash
-source .venv/bin/activate
-
 # Real-time webcam detection
 python realtime_detection.py
+python realtime_detection.py --camera 1      # if index 0 is taken or shows black
+python realtime_detection.py --debug         # print gender score + age per frame
 
 # Single image (no webcam needed)
-python scripts/predict_image.py --image path/to/photo.jpg --save output.jpg
+python scripts/predict_image.py --image path/to/photo.jpg --save output/annotated.jpg
 ```
 
-Press `q` to quit the webcam window.
+Activate the venv first (`source .venv/bin/activate`, or `.\.venv\Scripts\Activate.ps1`), or call the venv interpreter directly and skip activation entirely:
+
+```bash
+.\.venv\Scripts\python.exe realtime_detection.py     # Windows
+./.venv/bin/python realtime_detection.py              # macOS / Linux
+```
+
+Press `q` to quit the webcam window. All faces in a frame are batched into one forward pass, and the camera is always released on exit.
 
 ## Retraining the Model
 
 The model was trained on [UTKFace](https://susanqq.github.io/UTKFace/). Download it, then either:
 
-**Option A — Notebook** (includes EDA + plots):
+**Option A — Notebook** (includes EDA + plots; needs `bash setup.sh --train` first):
 ```bash
-jupyter notebook notebooks/ageandgender.ipynb
+python -m notebook notebooks/ageandgender.ipynb
 ```
 
 **Option B — Script:**
@@ -111,25 +149,33 @@ jupyter notebook notebooks/ageandgender.ipynb
 python scripts/train.py --data-path /path/to/UTKFace --epochs 50
 ```
 
-The final model is saved to `models/age_gender_custom_cnn_v1.keras`.
+Notes:
+
+- Image discovery accepts `*.jpg`, `*.jpeg` **and** `*.png` (UTKFace mirrors differ), and it stops with a clear message instead of an opaque `shuffle(buffer_size=0)` error when the folder has nothing usable in it.
+- Rows whose gender label is not `0` or `1` are dropped — some mirrors encode "unknown" as `2`, which corrupts a sigmoid head.
+- The exported model has the training-only augmentation layers **stripped**, so the saved graph is pure inference. Feed it raw `0–255` pixels as before.
+- `models/age_gender_custom_cnn_v1.keras` is overwritten by default; pass `--output models/my_run.keras` to keep the current one and diff the two.
+- If you point `--data-path` at the extracted archive root instead of the inner `UTKFace/` folder, you'll get the "No images matched" error — that nesting is normal for this dataset.
 
 ## Project Structure
 
 ```
-age-gender-detection/
-├── realtime_detection.py     # Live webcam inference
+AgeGenderDetection/
+├── realtime_detection.py      # Live webcam inference
 ├── scripts/
 │   ├── train.py               # Script version of the training notebook
-│   └── predict_image.py       # Single-image inference (no webcam)
+│   └── predict_image.py       # Single-image inference (no webcam, works headless)
 ├── notebooks/
 │   └── ageandgender.ipynb     # Full training notebook (EDA, training, eval plots)
 ├── models/
-│   └── age_gender_custom_cnn_v1.keras
+│   └── age_gender_custom_cnn_v1.keras   # 59MB, committed (see Big files below)
 ├── haarcascade/
 │   └── haarcascade_frontalface_default.xml
+├── output/                    # Sample annotated results (regenerable)
 ├── requirements.txt           # Inference-only deps
 ├── requirements-train.txt     # Extra deps for (re)training
-├── setup.sh
+├── setup.sh                   # bash only (macOS/Linux)
+├── .gitattributes             # line-ending + binary rules
 └── LICENSE
 ```
 
@@ -139,13 +185,63 @@ age-gender-detection/
 
 **Dataset skew:** UTKFace is skewed toward adult faces; expect lower accuracy on children and the elderly unless you augment with a more balanced dataset.
 
+**Augmentation layers inside the saved model (fixed for future runs):** `data_augmentation` (`RandomFlip`/`RandomRotation`/`RandomZoom`) used to be part of the graph that got serialized, so every inference run carried dead layers — inert at `training=False`, but dead weight in a 59MB artifact. `scripts/train.py` now rebuilds the same topology with `augment=False`, copies the weights across (the augmentation stack holds no weights, so `get_weights()` lines up 1:1) and saves *that*. The committed `age_gender_custom_cnn_v1.keras` still has the submodel; retraining replaces it.
+
+**Keras 2 vs 3:** the committed model is a Keras 3 file. Under TF 2.15 (Keras 2.15), `load_model()` fails with:
+
+```
+TypeError: Could not deserialize class 'Functional' because its parent module
+keras.src.models.functional cannot be imported.
+```
+
+That is why `requirements.txt` floors at 2.16. If you hit it, you have an older TensorFlow left over from another project — `python -m pip install --force-reinstall "tensorflow>=2.16,<2.17"`.
+
+## Big files
+
+`models/age_gender_custom_cnn_v1.keras` (59 MB) and the `output/` samples are committed as plain git objects, with no LFS. Clones are therefore slow and browser/OneDrive copies of the repo frequently end up **missing the big files** — if `requirements.txt` and the `.py` files are present but `models/` isn't, you have a partial copy and need a real `git clone`. To keep new weights out of history:
+
+```bash
+git lfs install
+git lfs track "*.keras"      # then add .gitattributes' lfs rule
+# or better: ship large artifacts as a GitHub Release asset and download on setup
+```
+
+Existing history isn't rewritten by this — that needs `git lfs migrate`, which rewrites every commit hash.
+
 ## Troubleshooting
 
 **`ModuleNotFoundError: No module named 'tensorflow'`**
-→ Activate the venv first: `source .venv/bin/activate`
+→ Activate the venv first (`source .venv/bin/activate` / `.\.venv\Scripts\Activate.ps1`), or run the venv interpreter by path.
 
-**Webcam doesn't open / black window**
-→ Try a different camera index: `cv2.VideoCapture(1)` instead of `0` in `realtime_detection.py`.
+**`TypeError: Could not deserialize class 'Functional'`**
+→ Your env has TensorFlow 2.15 / Keras 2, which cannot read this Keras 3 model. `python -m pip install --force-reinstall "tensorflow>=2.16,<2.17"` — see [Known Issues](#known-issues--lessons-learned).
+
+**`Could not open camera index 0`**
+→ `python realtime_detection.py --camera 1`. On Windows the Camera app, Teams or Zoom holding the device produces this too — close them. If `--camera` guessing is tedious, probe the indexes:
+```bash
+python -c "import cv2; [print(i, cv2.VideoCapture(i).isOpened()) for i in range(3)]"
+```
+
+**Black window that never updates after the first run**
+→ The camera was left locked because the old script exited without `cap.release()`. The loop now runs inside `try/finally`. If you're on an older copy, kill the stuck python process (Task Manager / `pkill -f realtime_detection`) or unplug/replug the webcam.
+
+**`This OpenCV build has no GUI support (headless)` / `ImportError: libGL.so.1`**
+→ Linux containers and WSL lack the GL libs. Either `pip install opencv-python-headless --force-reinstall` and use `scripts/predict_image.py --save`, or `sudo apt-get install -y libgl1 libglib2.0-0`.
+
+**`Annotated image saved to: ...` but no file exists**
+→ Fixed. `cv2.imwrite` has two failure modes: it returns `False` for a missing parent directory (the old code printed "saved" anyway) and it *raises* `cv2.error: could not find a writer for the specified extension` for a format OpenCV cannot encode. Both are now handled, and the parent folder is created for you. Valid extensions: `.png`, `.jpg`, `.jpeg`, `.bmp`, `.tiff`.
+
+**Gender accuracy reads as a huge percentage (e.g. `3432.00%`) after retraining**
+→ You're on the old notebook/train.py, which read `evaluate()` results by index. Keras 3 puts `output_age_mae` where Keras 2 puts `output_gender_accuracy`, so those two numbers swap and MAE gets printed as a "percentage". Fixed by reading results by key via `evaluate(return_dict=True)`. Don't try `model.metrics_names` as a workaround — under Keras 3 it returns a `compile_metrics` entry and omits the head metric names, so the list doesn't even line up with the results.
+
+**`A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x`**
+→ `python -m pip install "numpy<2" --force-reinstall`, and install all of `requirements.txt` in one `pip install` pass so the resolver can pick 1.26.x for you.
+
+**`Found 0 image files` when retraining**
+→ Either the archive wasn't extracted (UTKFace nests images in an inner `UTKFace/` folder) or it's the `.png` variant, which the old glob ignored. Point `--data-path` at the folder that actually holds the images.
+
+**Training run prints a metric list that doesn't match its own results**
+→ Fixed. `model.metrics_names` does still exist on Keras 3.0 – 3.15 (verified), but under Keras 3 it returns `['loss', 'compile_metrics', 'output_gender_loss', 'output_age_loss']` for a model whose `evaluate()` returns **five** values — the two head metrics are missing and a `compile_metrics` placeholder is inserted, so the printed "names" line up with nothing. Worse, `test_results[3]`/`[4]` swap meaning between Keras 2 and Keras 3 (see above). Both `scripts/train.py` and notebook cell 26 now use `evaluate(return_dict=True)` and read by key, which is correct on either Keras.
 
 **Predictions look constant / barely change across faces**
 → Check you're not normalizing pixel values before passing them to the model — see [Known Issues](#known-issues--lessons-learned).
