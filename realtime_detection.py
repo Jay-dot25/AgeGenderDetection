@@ -267,6 +267,7 @@ def main():
         )
 
         gate = FrameGate(enabled=args.skip_dupes)
+        processed_any = False
 
         while True:
             ret, frame = cap.read()
@@ -277,15 +278,19 @@ def main():
             if gate.accept(frame):
                 analyze_frame(model, face_cascade, tracker, frame, args)
 
+            processed_any = True
             cv2.imshow(WINDOW_NAME, frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        if gate.repeated:
-            print(f"Frames: {gate.summary()}. "
-                  "On Windows, --backend dshow usually stops the repeats at the source; "
-                  "--no-skip-dupes re-enables per-read inference.")
+        # Unconditional: "0 duplicate read(s)" is the result of the dshow
+        # experiment, not an absence of one, and silence cannot tell the two apart.
+        if processed_any:
+            print(f"Frames: {gate.summary()}."
+                  + ("" if not gate.repeated else
+                     " --backend dshow usually stops these at the source; "
+                     "--no-skip-dupes re-enables per-read inference."))
     finally:
         # Always runs -- on Ctrl+C, on an exception, on 'q'. Skipping this leaves
         # the capture device locked on Windows, which looks like a broken camera
