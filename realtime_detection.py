@@ -247,8 +247,8 @@ def main():
     if not cap.isOpened():
         raise SystemExit(
             f"Could not open camera index {args.camera} with backend '{args.backend}'. "
-            "Try --camera 1 or --backend dshow, and close anything holding the webcam "
-            "(Windows Camera app, Teams, Zoom)."
+            f"Try --camera 1, or another backend ({', '.join(b for b in ('any', 'dshow', 'msmf') if b != args.backend)}), "
+            "and close anything holding the webcam (Windows Camera app, Teams, Zoom)."
         )
 
     try:
