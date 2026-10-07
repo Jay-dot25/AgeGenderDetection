@@ -34,6 +34,23 @@ def parse_args():
     return parser.parse_args()
 
 
+def _feed(model, batch):
+    """Wrap the batch as {input_name: batch} for a single named input.
+
+    Keras 3 warns ("The structure of `inputs` doesn't match the expected
+    structure") on every bare-array call, including model.predict(). Feeding by
+    name is silent and bit-identical.
+    """
+    try:
+        if len(model.inputs) == 1:
+            name = model.inputs[0].name.split(":")[0]
+            if name:
+                return {name: batch}
+    except Exception:
+        pass
+    return batch
+
+
 def predict_faces(model, gray, faces):
     """
     One batched forward pass for every face found. Returns (gender_scores, ages)
@@ -45,7 +62,7 @@ def predict_faces(model, gray, faces):
     crops = np.expand_dims(crops, axis=-1)  # (N, 128, 128, 1)
 
     # Feed RAW 0-255 pixels -- the model has its own Rescaling(1/255) layer built in.
-    gender_pred, age_pred = model.predict(crops, verbose=0)
+    gender_pred, age_pred = model.predict(_feed(model, crops), verbose=0)
 
     return np.asarray(gender_pred).reshape(-1), np.asarray(age_pred).reshape(-1)
 

@@ -61,6 +61,27 @@ def load_model_and_cascade():
     return model, face_cascade
 
 
+def _feed(model, batch):
+    """
+    Wrap the batch as {input_name: batch} when the model has one named input.
+
+    Keras 3 emits "UserWarning: The structure of `inputs` doesn't match the
+    expected structure" on every call that passes a bare array to a Functional
+    model whose input layer is named -- including model.predict(), so this was
+    noisy before too. During a webcam session it prints twice per new face
+    count, burying real output. Feeding by name is bit-identical (verified
+    delta 0.0 on gender and age) and silent.
+    """
+    try:
+        if len(model.inputs) == 1:
+            name = model.inputs[0].name.split(":")[0]
+            if name:
+                return {name: batch}
+    except Exception:
+        pass
+    return batch
+
+
 def predict_faces(model, gray, faces):
     """
     Runs one batched forward pass for every face in the frame.
@@ -78,10 +99,10 @@ def predict_faces(model, gray, faces):
     try:
         # Direct call is much cheaper per frame than predict(), which rebuilds
         # its data pipeline machinery on every invocation.
-        gender_pred, age_pred = model(crops, training=False)
+        gender_pred, age_pred = model(_feed(model, crops), training=False)
         gender_pred, age_pred = gender_pred.numpy(), age_pred.numpy()
     except Exception:
-        gender_pred, age_pred = model.predict(crops, verbose=0)
+        gender_pred, age_pred = model.predict(_feed(model, crops), verbose=0)
 
     return np.asarray(gender_pred).reshape(-1), np.asarray(age_pred).reshape(-1)
 
