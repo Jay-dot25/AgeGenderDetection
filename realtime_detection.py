@@ -61,6 +61,15 @@ def parse_args():
         help="merge boxes above this IoU into one detection (default: 0.3)",
     )
     parser.add_argument("--no-nms", action="store_true", help="disable duplicate-box merging")
+    parser.add_argument(
+        "--backend", choices=("any", "dshow", "msmf"), default="any",
+        help="VideoCapture API. Windows' default MSMF path re-delivers the same frame "
+             "to a slower reader; 'dshow' often stops that at the source",
+    )
+    parser.add_argument(
+        "--no-skip-dupes", action="store_true",
+        help="run inference on every read, even when the camera handed back an identical frame",
+    )
     return parser.parse_args()
 
 
@@ -128,6 +137,63 @@ def predict_faces(model, gray, faces):
     return np.asarray(gender_pred).reshape(-1), np.asarray(age_pred).reshape(-1)
 
 
+_STRIDE = 8
+
+
+class FrameGate:
+    """
+    Lets each distinct camera frame through once, absorbing re-reads.
+
+    cv2.VideoCapture on Windows (MSMF) hands the same sensor sample back when
+    the consumer runs slower than the sensor -- measured at 44% of reads in a
+    live session. Passing those through again spends inference on nothing new
+    and double-weights the tracker's EMA on exactly the frames where the face
+    is most stable, which is where you least want it biased.
+    """
+
+    def __init__(self, enabled=True):
+        self.enabled = bool(enabled)
+        self.accepted = 0
+        self.repeated = 0
+        self._last = None
+
+    def accept(self, frame):
+        """True if this frame is new and should be analysed."""
+        if not self.enabled:
+            self.accepted += 1
+            return True
+
+        sig = frame_signature(frame)
+        if self._last is not None and sig.shape == self._last.shape and np.array_equal(sig, self._last):
+            self.repeated += 1
+            return False
+
+        self._last = sig
+        self.accepted += 1
+        return True
+
+    def summary(self):
+        total = self.accepted + self.repeated
+        if not total:
+            return "no frames read"
+        return f"{self.accepted} analysed, {self.repeated} duplicate read(s) skipped ({100 * self.repeated / total:.0f}%)"
+
+
+def frame_signature(frame):
+    """
+    Cheap fingerprint of a captured frame: every 8th pixel of one channel.
+
+    Used only to spot a byte-identical re-read of the SAME camera frame, which
+    the Windows MSMF capture path does routinely when the consumer is slower
+    than the sensor. Sampling one channel every 8th pixel makes a false "same
+    frame" verdict possible if something moved by less than 8 pixels, and the
+    cost of that is one skipped inference pass on a scene that was already
+    analysed a frame ago -- far cheaper than double-weighting the EMA on every
+    static moment. Contiguous, so it does not pin the full frame buffer.
+    """
+    return np.ascontiguousarray(frame[::_STRIDE, ::_STRIDE, 0])
+
+
 def analyze_frame(model, face_cascade, tracker, frame, args):
     """
     Detect -> merge -> predict -> smooth, for one frame.
@@ -171,15 +237,18 @@ def main():
     args = parse_args()
     if args.no_smooth:
         args.smooth = 1
+    args.skip_dupes = not args.no_skip_dupes
 
     model, face_cascade = load_model_and_cascade()
     tracker = FaceTracker(window=args.smooth, gender_margin=args.gender_margin)
 
-    cap = cv2.VideoCapture(args.camera)
+    backend = {"any": cv2.CAP_ANY, "dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}[args.backend]
+    cap = cv2.VideoCapture(args.camera, backend)
     if not cap.isOpened():
         raise SystemExit(
-            f"Could not open camera index {args.camera}. "
-            "Try --camera 1, and close anything holding the webcam (Windows Camera app, Teams, Zoom)."
+            f"Could not open camera index {args.camera} with backend '{args.backend}'. "
+            "Try --camera 1 or --backend dshow, and close anything holding the webcam "
+            "(Windows Camera app, Teams, Zoom)."
         )
 
     try:
@@ -197,18 +266,26 @@ def main():
             f" | duplicate-box merging: {'off' if args.no_nms else f'IoU {args.nms_iou:.2f}'}"
         )
 
+        gate = FrameGate(enabled=args.skip_dupes)
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("Camera stopped returning frames; exiting.")
                 break
 
-            analyze_frame(model, face_cascade, tracker, frame, args)
+            if gate.accept(frame):
+                analyze_frame(model, face_cascade, tracker, frame, args)
 
             cv2.imshow(WINDOW_NAME, frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
+        if gate.repeated:
+            print(f"Frames: {gate.summary()}. "
+                  "On Windows, --backend dshow usually stops the repeats at the source; "
+                  "--no-skip-dupes re-enables per-read inference.")
     finally:
         # Always runs -- on Ctrl+C, on an exception, on 'q'. Skipping this leaves
         # the capture device locked on Windows, which looks like a broken camera

@@ -138,6 +138,8 @@ python scripts/predict_image.py --image path/to/photo.jpg --save output/annotate
 | `--gender-margin X` | `0.05` | hysteresis half-band around 0.5; `0.0` = plain threshold |
 | `--nms-iou X` | `0.3` | merge Haar boxes above this overlap |
 | `--no-nms` | – | keep every box the detector returns |
+| `--backend` | `any` | `dshow` on Windows when the camera re-delivers frames |
+| `--no-skip-dupes` | – | analyse every read, including identical re-reads |
 | `--min-face N` | `60` | smallest face to look for, in px |
 | `--scale-factor X` | `1.3` | detector step size; higher = faster, fewer misses turned detections |
 
@@ -154,11 +156,15 @@ Press `q` to quit the webcam window. All faces in a frame are batched into one f
 
 The CNN is fine; `cv2.CascadeClassifier` is not a tracker, and neither is a per-frame threshold. Three things in `detection_utils.py` close that gap, all measured against a real 239-frame webcam session:
 
-**Duplicate boxes → `non_max_suppression()`.** `detectMultiScale` routinely reports the same face two or three times. In the recorded session **102 of 137 distinct predictions came in identical pairs**, which draws a doubled rectangle and ghost-doubles the label text, and pays 2x inference for nothing. Boxes are ranked by area (Haar gives no confidence score), then any later box that overlaps a kept one is dropped on *either* IoU `> 0.3` *or* containment `> 0.7` — the second test catches a small box nested inside a big one, whose IoU alone can look innocent (`0.09`). Two real adjacent faces score low on both and survive.
+**Duplicate boxes → `non_max_suppression()`.** `detectMultiScale` reports the same face two or three times, which draws a doubled rectangle, ghost-doubles the label text and pays 2x inference for nothing. Boxes are ranked by area (Haar gives no confidence score), then any later box that overlaps a kept one is dropped on *either* IoU `> 0.3` *or* containment `> 0.7` — the second test catches a small box nested inside a big one, whose IoU alone can look innocent (`0.09`). Two real adjacent faces score low on both and survive.
 
 **Jittery numbers → `FaceTracker` EMA.** Frame-to-frame age moved by 1.71 years on average, worst case 13.32 years, with 57 jumps over 3 years. Each detected face keeps its own exponentially-weighted average (`alpha = 2/(window+1)`) of age and gender score, matched across frames by IoU so two people in one frame are never averaged together. On a noisy sequence this took the spread from sd 5.69 to sd 1.48 while still tracking a genuine drift, and a steady face is not drifted at all.
 
 **Flapping labels → hysteresis.** **41% of frames sat in the 0.40–0.50 band** — right under a 0.5 cutoff, one pixel of noise from flipping the verdict. A face already labelled `Male` stays `Male` until the smoothed score clears `0.5 + margin` (and vice versa); before any label is established, a score inside the band reads `Uncertain` rather than guessing. That first `Uncertain` is a feature, not a regression: it means the model genuinely cannot tell.
+
+**Duplicate frames → `FrameGate`.** After box merging was in place, a second live session still showed **44% of prints re-seeing the previous frame bit-for-bit** — the raw score and age were identical while only the smoothed value advanced. That is `cv2.VideoCapture` on Windows (MSMF) handing the same sensor sample back to a consumer that runs slower than the sensor, not a detection problem. Duplicate reads now cost nothing: the frame is re-displayed so the GUI keeps pumping, but inference and the EMA update are skipped, so a face holding still no longer gets weighted twice. `--backend dshow` frequently stops the repeats at the source; `--no-skip-dupes` restores per-read inference, and the exit line reports the split (e.g. `148 analysed, 118 duplicate read(s) skipped (44%)`).
+
+*Attribution note:* the doubling seen before any of this (74% paired) was a mix of both causes — NMS took it from 74% to 44%, the frame gate handles the rest.
 
 `--no-smooth --gender-margin 0 --no-nms` reproduces the original behavior exactly (verified: same 64.6654 age and 0.60243 score on the sample image), so you can A/B the pipeline against the raw model output.
 
@@ -274,6 +280,9 @@ python -c "import cv2; [print(i, cv2.VideoCapture(i).isOpened()) for i in range(
 → Fixed. `model.metrics_names` does still exist on Keras 3.0 – 3.15 (verified), but under Keras 3 it returns `['loss', 'compile_metrics', 'output_gender_loss', 'output_age_loss']` for a model whose `evaluate()` returns **five** values — the two head metrics are missing and a `compile_metrics` placeholder is inserted, so the printed "names" line up with nothing. Worse, `test_results[3]`/`[4]` swap meaning between Keras 2 and Keras 3 (see above). Both `scripts/train.py` and notebook cell 26 now use `evaluate(return_dict=True)` and read by key, which is correct on either Keras.
 
 **The same face gets two boxes and doubled-up text**
+→ Two separate causes, both handled: overlapping Haar rectangles (merged by `--nms-iou`) and the camera handing back the same frame twice on Windows (skipped by `FrameGate`; try `--backend dshow` to stop it upstream). The exit line tells you which one you had.
+
+
 → Duplicate Haar rectangles. The default NMS merge removes them; `--no-nms` reproduces them, and `--nms-iou 0.15` merges more aggressively if pairs still show.
 
 **The age number bounces around between frames**
