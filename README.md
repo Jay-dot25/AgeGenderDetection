@@ -33,6 +33,8 @@ Detects faces from a webcam (or a single image) and predicts **age** and **gende
 └────────────────────────────────────────────────┘
 ```
 
+*Between the model and the overlay sits a post-processing stage in `detection_utils.py` — duplicate-box merging and per-face smoothing. See [Prediction stability](#prediction-stability).*
+
 ## Training Pipeline
 
 ```
@@ -120,11 +122,24 @@ Notes for Windows checkouts:
 # Real-time webcam detection
 python realtime_detection.py
 python realtime_detection.py --camera 1      # if index 0 is taken or shows black
-python realtime_detection.py --debug         # print gender score + age per frame
+python realtime_detection.py --debug         # raw -> smoothed readout per face
+python realtime_detection.py --no-smooth     # per-frame values, as they come from the model
+python realtime_detection.py --no-nms        # show every raw Haar box, duplicates included
 
 # Single image (no webcam needed)
 python scripts/predict_image.py --image path/to/photo.jpg --save output/annotated.jpg
 ```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--camera N` | `0` | `cv2.VideoCapture` index |
+| `--smooth N` | `5` | EMA window per face, in frames (`1` = off) |
+| `--no-smooth` | – | shorthand for `--smooth 1` |
+| `--gender-margin X` | `0.05` | hysteresis half-band around 0.5; `0.0` = plain threshold |
+| `--nms-iou X` | `0.3` | merge Haar boxes above this overlap |
+| `--no-nms` | – | keep every box the detector returns |
+| `--min-face N` | `60` | smallest face to look for, in px |
+| `--scale-factor X` | `1.3` | detector step size; higher = faster, fewer misses turned detections |
 
 Activate the venv first (`source .venv/bin/activate`, or `.\.venv\Scripts\Activate.ps1`), or call the venv interpreter directly and skip activation entirely:
 
@@ -134,6 +149,18 @@ Activate the venv first (`source .venv/bin/activate`, or `.\.venv\Scripts\Activa
 ```
 
 Press `q` to quit the webcam window. All faces in a frame are batched into one forward pass, and the camera is always released on exit.
+
+## Prediction stability
+
+The CNN is fine; `cv2.CascadeClassifier` is not a tracker, and neither is a per-frame threshold. Three things in `detection_utils.py` close that gap, all measured against a real 239-frame webcam session:
+
+**Duplicate boxes → `non_max_suppression()`.** `detectMultiScale` routinely reports the same face two or three times. In the recorded session **102 of 137 distinct predictions came in identical pairs**, which draws a doubled rectangle and ghost-doubles the label text, and pays 2x inference for nothing. Boxes are ranked by area (Haar gives no confidence score), then any later box that overlaps a kept one is dropped on *either* IoU `> 0.3` *or* containment `> 0.7` — the second test catches a small box nested inside a big one, whose IoU alone can look innocent (`0.09`). Two real adjacent faces score low on both and survive.
+
+**Jittery numbers → `FaceTracker` EMA.** Frame-to-frame age moved by 1.71 years on average, worst case 13.32 years, with 57 jumps over 3 years. Each detected face keeps its own exponentially-weighted average (`alpha = 2/(window+1)`) of age and gender score, matched across frames by IoU so two people in one frame are never averaged together. On a noisy sequence this took the spread from sd 5.69 to sd 1.48 while still tracking a genuine drift, and a steady face is not drifted at all.
+
+**Flapping labels → hysteresis.** **41% of frames sat in the 0.40–0.50 band** — right under a 0.5 cutoff, one pixel of noise from flipping the verdict. A face already labelled `Male` stays `Male` until the smoothed score clears `0.5 + margin` (and vice versa); before any label is established, a score inside the band reads `Uncertain` rather than guessing. That first `Uncertain` is a feature, not a regression: it means the model genuinely cannot tell.
+
+`--no-smooth --gender-margin 0 --no-nms` reproduces the original behavior exactly (verified: same 64.6654 age and 0.60243 score on the sample image), so you can A/B the pipeline against the raw model output.
 
 ## Retraining the Model
 
@@ -162,6 +189,7 @@ Notes:
 ```
 AgeGenderDetection/
 ├── realtime_detection.py      # Live webcam inference
+├── detection_utils.py         # NMS + per-face smoothing/hysteresis (no model deps)
 ├── scripts/
 │   ├── train.py               # Script version of the training notebook
 │   └── predict_image.py       # Single-image inference (no webcam, works headless)
@@ -182,6 +210,8 @@ AgeGenderDetection/
 ## Known Issues / Lessons Learned
 
 **Double-normalization bug (fixed):** the model's first real layer is `Rescaling(1./255.)`, meaning it expects raw `0–255` pixel values as input and divides by 255 itself. An earlier version of `realtime_detection.py` *also* divided the face crop by 255 before feeding it to the model, so every input was effectively scaled down to `~0–0.004` — close enough to a blank frame that the network just output its learned average for every face (age stuck around 45–48, gender always low-confidence "Male", regardless of who or what was in front of the camera). The fix was simply to stop normalizing manually and let the model's own `Rescaling` layer do it, since that's exactly how `scripts/train.py` / the notebook feed images during training.
+
+**Detector jitter (mitigated in software):** `cv2.CascadeClassifier` keeps no temporal state and returns no confidence score, so raw per-frame output double-counts faces and swings years of age between consecutive frames. `detection_utils.py` corrects this at inference rather than by retraining; measured before/after is in [Prediction stability](#prediction-stability).
 
 **Dataset skew:** UTKFace is skewed toward adult faces; expect lower accuracy on children and the elderly unless you augment with a more balanced dataset.
 
@@ -242,6 +272,15 @@ python -c "import cv2; [print(i, cv2.VideoCapture(i).isOpened()) for i in range(
 
 **Training run prints a metric list that doesn't match its own results**
 → Fixed. `model.metrics_names` does still exist on Keras 3.0 – 3.15 (verified), but under Keras 3 it returns `['loss', 'compile_metrics', 'output_gender_loss', 'output_age_loss']` for a model whose `evaluate()` returns **five** values — the two head metrics are missing and a `compile_metrics` placeholder is inserted, so the printed "names" line up with nothing. Worse, `test_results[3]`/`[4]` swap meaning between Keras 2 and Keras 3 (see above). Both `scripts/train.py` and notebook cell 26 now use `evaluate(return_dict=True)` and read by key, which is correct on either Keras.
+
+**The same face gets two boxes and doubled-up text**
+→ Duplicate Haar rectangles. The default NMS merge removes them; `--no-nms` reproduces them, and `--nms-iou 0.15` merges more aggressively if pairs still show.
+
+**The age number bounces around between frames**
+→ Expected from a frame-independent detector. `--smooth 5` is the default; go higher (`--smooth 12`) for a steadier number at the cost of a little lag when you genuinely move.
+
+**The label reads `Uncertain`**
+→ The gender score is inside the +/-0.05 band around 0.5, i.e. the model genuinely cannot tell on this face. `--gender-margin 0` forces a binary call like the original code, at the cost of flipping between frames.
 
 **Predictions look constant / barely change across faces**
 → Check you're not normalizing pixel values before passing them to the model — see [Known Issues](#known-issues--lessons-learned).
