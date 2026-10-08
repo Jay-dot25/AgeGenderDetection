@@ -146,9 +146,11 @@ class FrameGate:
 
     cv2.VideoCapture on Windows (MSMF) hands the same sensor sample back when
     the consumer runs slower than the sensor -- measured at 44% of reads in a
-    live session. Passing those through again spends inference on nothing new
-    and double-weights the tracker's EMA on exactly the frames where the face
-    is most stable, which is where you least want it biased.
+    live session, and 0% from the same camera under --backend dshow, which is
+    where the problem actually belongs. Passing those through again spends
+    inference on nothing new and double-weights the tracker's EMA on exactly
+    the frames where the face is most stable, which is where you least want it
+    biased. This gate is the safety net; dshow is the fix.
     """
 
     def __init__(self, enabled=True):

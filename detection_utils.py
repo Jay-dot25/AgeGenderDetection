@@ -8,9 +8,11 @@ and smoothing logic can be reasoned about -- and tested -- on its own.
 Two jobs, because cv2.CascadeClassifier gives you neither:
 
 1. non_max_suppression() -- detectMultiScale returns overlapping rectangles for
-   the SAME face (in a real session roughly three quarters of detections came in
-   duplicate pairs), which doubles the boxes, ghost-doubles the label text and
-   doubles inference cost for zero information.
+   the SAME face, which doubles the boxes, ghost-doubles the label text and
+   doubles inference cost for zero information. (Worth knowing: when a session
+   shows predictions arriving in identical pairs, suspect duplicate *frames*
+   from the capture backend first -- see FrameGate in realtime_detection.py.
+   Box overlap was the smaller share of that effect, not the whole of it.)
 
 2. FaceTracker -- Haar is frame-independent, so the raw predictions jitter:
    measured frame-to-frame age swings averaged 1.7 years with a 13-year
