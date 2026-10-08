@@ -14,7 +14,15 @@ Two jobs, because cv2.CascadeClassifier gives you neither:
    from the capture backend first -- see FrameGate in realtime_detection.py.
    Box overlap was the smaller share of that effect, not the whole of it.)
 
-2. FaceTracker -- Haar is frame-independent, so the raw predictions jitter:
+2. crop policy (face_crops) -- the network was trained on UTKFace's *aligned*
+   200x200 crops, where the head sits framed with its forehead and some margin.
+   A Haar box is a different window on the same face: tighter, anchored brow to
+   chin, and never square. Feeding it straight in rescales a differently framed
+   face than the one the weights were fitted on, which is a systematic bias no
+   amount of temporal smoothing can remove. Measure the difference with
+   scripts/eval_pipeline.py before changing the default.
+
+3. FaceTracker -- Haar is frame-independent, so the raw predictions jitter:
    measured frame-to-frame age swings averaged 1.7 years with a 13-year
    maximum, and a gender score sitting near 0.5 flips the printed label between
    identical frames. Per-face EMA plus label hysteresis fixes both.
@@ -97,6 +105,99 @@ def non_max_suppression(faces, iou_threshold=0.3, containment_threshold=0.7):
             keep.append(i)
 
     return np.asarray([boxes[i] for i in sorted(keep)], dtype="int32")
+
+
+# ---------------------------------------------------------------------------
+# Crop policy
+# ---------------------------------------------------------------------------
+
+CROP_HAAR = "haar"
+CROP_SQUARE = "square"
+CROP_POLICIES = (CROP_HAAR, CROP_SQUARE)
+
+# Starting point for the square policy, deliberately conservative: Haar boxes
+# run tighter and lower than the training crops, so widen a little and lift a
+# little. These are hypotheses to test with scripts/eval_pipeline.py --search,
+# not measured constants, which is why CROP_HAAR remains the default.
+DEFAULT_CROP_SCALE = 1.15
+DEFAULT_CROP_Y_SHIFT = -0.08
+
+
+def crop_window(box, image_shape, policy=CROP_HAAR, scale=DEFAULT_CROP_SCALE,
+                 y_shift=DEFAULT_CROP_Y_SHIFT):
+    """
+    Where to cut a face out of an image, as (x0, y0, x1, y1, pl, pt, pr, pb).
+
+    policy="haar"   -- the box exactly as detectMultiScale reported it, which is
+                       what this project has always fed to the model.
+    policy="square" -- a square window of side max(w, h) * scale, centred on the
+                       box horizontally and on cy + y_shift * h vertically. Square
+                       because the training crops are square: forcing a non-square
+                       Haar box to 128x128 stretches the face, and stretching is a
+                       distribution shift the network has never seen before.
+
+    The square window is clamped to the image and the shortfall is reported as
+    per-side padding, so the crop always comes back exactly side x side instead
+    of silently shrinking at the edge of a frame -- a face near the border should
+    not be scored on a different geometry than the same face in the middle.
+
+    Out-of-range boxes are handled by clamping the centre first, so the window
+    always contains at least one in-bounds pixel.
+    """
+    x, y, w, h = (int(v) for v in tuple(box)[:4])
+    if policy == CROP_HAAR:
+        return x, y, x + w, y + h, 0, 0, 0, 0
+    if policy != CROP_SQUARE:
+        raise ValueError(f"unknown crop policy {policy!r}; expected one of {CROP_POLICIES}")
+
+    height, width = int(image_shape[0]), int(image_shape[1])
+    cx = x + w / 2.0
+    cy = y + h / 2.0 + float(y_shift) * h
+    # Keep the anchor inside the image so the window can never miss it entirely.
+    cx = min(max(cx, 0.0), width - 1.0)
+    cy = min(max(cy, 0.0), height - 1.0)
+
+    side = max(1, int(round(max(w, h) * float(scale))))
+    x0, y0 = int(round(cx - side / 2.0)), int(round(cy - side / 2.0))
+    x1, y1 = x0 + side, y0 + side
+
+    pl, pt = max(0, -x0), max(0, -y0)
+    pr, pb = max(0, x1 - width), max(0, y1 - height)
+    return x0 + pl, y0 + pt, x1 - pr, y1 - pb, pl, pt, pr, pb
+
+
+def face_crop(gray, box, policy=CROP_HAAR, scale=DEFAULT_CROP_SCALE, y_shift=DEFAULT_CROP_Y_SHIFT):
+    """
+    One face, cropped but not yet resized. See crop_window().
+
+    With policy="haar" this is a view of `gray`, not a copy, so the default path
+    costs exactly what the inline slice it replaced cost.
+    """
+    x0, y0, x1, y1, pl, pt, pr, pb = crop_window(box, gray.shape, policy, scale, y_shift)
+    crop = gray[y0:y1, x0:x1]
+    if pl or pt or pr or pb:
+        crop = np.pad(crop, ((pt, pb), (pl, pr)), mode="edge")
+    return crop
+
+
+def face_crops(gray, boxes, policy=CROP_HAAR, scale=DEFAULT_CROP_SCALE, y_shift=DEFAULT_CROP_Y_SHIFT):
+    """
+    face_crop() for a whole frame's worth of boxes, in input order.
+
+    Deliberately stops short of cv2.resize: this module has no OpenCV
+    dependency, so the geometry above can be tested with numpy alone.
+    """
+    return [
+        face_crop(gray, box, policy=policy, scale=scale, y_shift=y_shift)
+        for box in ([] if boxes is None else boxes)
+    ]
+
+
+def describe_crop_policy(policy, scale=DEFAULT_CROP_SCALE, y_shift=DEFAULT_CROP_Y_SHIFT):
+    """One-line description for the startup banner and the eval report header."""
+    if policy == CROP_HAAR:
+        return "haar (raw detectMultiScale box)"
+    return f"square (side = max(w,h) x {scale:.2f}, y shift {y_shift:+.2f} of box height)"
 
 
 class FaceTracker:

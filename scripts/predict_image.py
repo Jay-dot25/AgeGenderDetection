@@ -25,7 +25,14 @@ CASCADE_PATH = os.path.join(BASE_DIR, "haarcascade", "haarcascade_frontalface_de
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from detection_utils import FaceTracker, format_label, non_max_suppression  # noqa: E402
+from detection_utils import (  # noqa: E402
+    DEFAULT_CROP_SCALE,
+    DEFAULT_CROP_Y_SHIFT,
+    FaceTracker,
+    face_crops,
+    format_label,
+    non_max_suppression,
+)
 
 IMG_SIZE = 128           # the model input is 128x128x1 grayscale
 
@@ -54,10 +61,18 @@ def predict_faces(model, gray, faces):
     One batched forward pass for every face found. Returns (gender_scores, ages)
     aligned with `faces`.
     """
-    crops = np.stack(
-        [cv2.resize(gray[y : y + h, x : x + w], (IMG_SIZE, IMG_SIZE)).astype("float32") for (x, y, w, h) in faces]
-    )
-    crops = np.expand_dims(crops, axis=-1)  # (N, 128, 128, 1)
+    # Same crop helper as the webcam path, so the two cannot drift apart and
+    # scripts/eval_pipeline.py measures a framing that this tool also uses.
+    crops = [
+        cv2.resize(c, (IMG_SIZE, IMG_SIZE)).astype("float32")
+        for c in face_crops(
+            gray, faces, policy="haar",
+            scale=DEFAULT_CROP_SCALE, y_shift=DEFAULT_CROP_Y_SHIFT,
+        )
+    ]
+    if not crops:
+        return np.zeros((0,), dtype="float32"), np.zeros((0,), dtype="float32")
+    crops = np.expand_dims(np.stack(crops), axis=-1)  # (N, 128, 128, 1)
 
     # Feed RAW 0-255 pixels -- the model has its own Rescaling(1/255) layer built in.
     gender_pred, age_pred = model.predict(_feed(model, crops), verbose=0)

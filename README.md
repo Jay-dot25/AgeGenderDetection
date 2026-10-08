@@ -125,9 +125,14 @@ python realtime_detection.py --camera 1      # if index 0 is taken or shows blac
 python realtime_detection.py --debug         # raw -> smoothed readout per face
 python realtime_detection.py --no-smooth     # per-frame values, as they come from the model
 python realtime_detection.py --no-nms        # show every raw Haar box, duplicates included
+python realtime_detection.py --crop-policy square   # re-frame crops like the training data
 
 # Single image (no webcam needed)
 python scripts/predict_image.py --image path/to/photo.jpg --save output/annotated.jpg
+
+# Measure the whole app (detection + cropping included), not just the model
+python scripts/eval_pipeline.py --data-path path/to/UTKFace
+python scripts/eval_pipeline.py --data-path path/to/UTKFace --search
 ```
 
 | Flag | Default | Meaning |
@@ -140,6 +145,9 @@ python scripts/predict_image.py --image path/to/photo.jpg --save output/annotate
 | `--no-nms` | – | keep every box the detector returns |
 | `--backend` | `any` | `dshow` on Windows when the camera re-delivers frames |
 | `--no-skip-dupes` | – | analyse every read, including identical re-reads |
+| `--crop-policy` | `haar` | `square` re-frames the Haar box toward the training crops — measure before switching |
+| `--crop-scale X` | `1.15` | side of the square crop, as a multiple of the box's larger side |
+| `--crop-y-shift X` | `-0.08` | lifts the square crop (negative = more forehead), as a fraction of box height |
 | `--min-face N` | `60` | smallest face to look for, in px |
 | `--scale-factor X` | `1.3` | detector step size; higher = faster, fewer misses turned detections |
 
@@ -168,6 +176,86 @@ The CNN is fine; `cv2.CascadeClassifier` is not a tracker, and neither is a per-
 
 `--no-smooth --gender-margin 0 --no-nms` reproduces the original behavior exactly (verified: same 64.6654 age and 0.60243 score on the sample image), so you can A/B the pipeline against the raw model output.
 
+## Measuring the whole app
+
+The metrics this project quotes come from the notebook, which evaluates the model on
+UTKFace's own pre-cropped, pre-aligned faces. The webcam app is a bigger system: Haar proposes
+a box, that box is cut out and resized, and only then does the network see a face. Nothing in
+this repository measured that path, so the accuracy above has always described a friendlier
+problem than the one the app actually solves.
+
+`scripts/eval_pipeline.py` closes that. It runs the app's own functions — same cascade, same
+duplicate merging, same `make_crops()`, same forward pass — over the *same* test split the
+model was validated on, and reports two arms:
+
+| Arm | Input | What it measures |
+|---|---|---|
+| `model` | whole image resized to 128 | the framing the weights were fitted on |
+| `pipeline` | detected → cropped → resized | what a webcam actually feeds the network |
+
+The gap between those two rows is the cost of detection and framing. It is the number to quote
+when someone asks how accurate the app is, and it is the number that says whether a change to
+the crop, the detector or the smoothing helped or hurt — which is the only reason to believe
+any future "improvement" here.
+
+```powershell
+.venv\Scripts\python.exe scripts\eval_pipeline.py --data-path C:\data\UTKFace
+.venv\Scripts\python.exe scripts\eval_pipeline.py --data-path C:\data\UTKFace --limit 500
+.venv\Scripts\python.exe scripts\eval_pipeline.py --data-path C:\data\UTKFace --search
+.venv\Scripts\python.exe scripts\eval_pipeline.py --data-path C:\data\UTKFace --dump-crops 12
+```
+
+It needs the dataset and `requirements-train.txt`, and it *imports* the split from
+`scripts/train.py` rather than copying it: two copies of `train_test_split(df, test_size=0.2,
+random_state=42)` is exactly how you end up with two scripts that both claim "the test set"
+while scoring different images. Images the detector misses are counted and reported rather than
+dropped, because a miss is an error the app makes.
+
+Other flags: `--json out.json` writes the numbers for a later diff, `--scales` / `--shifts`
+set the search grid (a value starting with `-` is accepted in both `--shifts -0.2,0.0` and
+`--shifts=-0.2,0.0` form), and `--min-face` / `--scale-factor` / `--nms-iou` must match the app
+for the result to describe the app — they default to the app's defaults.
+
+### The crop question, and how it gets decided
+
+`--crop-policy square` re-frames each Haar box into a square window before resizing. The
+reason: UTKFace's aligned images are square and include the forehead, while a Haar box hugs
+brow-to-chin, so forcing it to 128×128 both stretches the face and shows the network a framing
+it never saw during training.
+
+That is a hypothesis about a distribution shift, not a fact, so it ships disabled: the default
+is still `haar`, and `--crop-scale 1.15 --crop-y-shift -0.08` are a starting point rather than
+tuned constants. `--search` settles it on your data — it sweeps scale × shift, prints the MAE
+for each config ranked against a `haar` baseline row, and says plainly whether the gain is big
+enough to bother with (under 0.05 years it tells you to drop the idea). `--dump-crops 12`
+writes strips of what the network actually sees, which matters because a crop can also "win" on
+MAE for a bad reason, e.g. by cutting off the chin.
+
+If the search does show a real gain, re-run without `--search` to confirm the number holds, then
+paste the winning flags into `realtime_detection.py`'s defaults *in a commit that says why*.
+
+## Tests
+
+```powershell
+.venv\Scripts\python.exe tests\test_detection_utils.py     # 154 checks, no framework needed
+pytest tests/                                                  # if you prefer pytest
+```
+
+They cover box merging, crop geometry, the tracker (EMA, hysteresis, expiry), the frame gate,
+the label format and `eval_pipeline`'s reporting — including an end-to-end run of the eval
+script against a fake model and a fake detector, so the scoreboard's wiring is tested even
+where no dataset exists.
+
+Tests whose dependency is missing **skip with a printed note** instead of failing an
+environment that legitimately has no model in it. The one that needs TensorFlow is also the one
+that matters most: it asserts the default configuration still prints **age 64.6654, gender
+0.60243** on `output/output2.png`, which is what turns "the defaults haven't moved" from a
+memory into a fact. `realtime_detection.py` defers its `import tensorflow` into
+`load_model_and_cascade()` for exactly that reason — the geometry tests should run with numpy
+and OpenCV alone.
+
+Run the suite before and after changing anything in `detection_utils.py`, and after a retrain.
+
 ## Retraining the Model
 
 The model was trained on [UTKFace](https://susanqq.github.io/UTKFace/). Download it, then either:
@@ -195,10 +283,13 @@ Notes:
 ```
 AgeGenderDetection/
 ├── realtime_detection.py      # Live webcam inference
-├── detection_utils.py         # NMS + per-face smoothing/hysteresis (no model deps)
+├── detection_utils.py         # NMS + crop policy + per-face smoothing (no model/OpenCV deps)
 ├── scripts/
 │   ├── train.py               # Script version of the training notebook
-│   └── predict_image.py       # Single-image inference (no webcam, works headless)
+│   ├── predict_image.py       # Single-image inference (no webcam, works headless)
+│   └── eval_pipeline.py       # Scores detection + framing on the real test split
+├── tests/
+│   └── test_detection_utils.py  # Post-processing + eval-harness checks, no framework needed
 ├── notebooks/
 │   └── ageandgender.ipynb     # Full training notebook (EDA, training, eval plots)
 ├── models/
@@ -218,6 +309,12 @@ AgeGenderDetection/
 **Double-normalization bug (fixed):** the model's first real layer is `Rescaling(1./255.)`, meaning it expects raw `0–255` pixel values as input and divides by 255 itself. An earlier version of `realtime_detection.py` *also* divided the face crop by 255 before feeding it to the model, so every input was effectively scaled down to `~0–0.004` — close enough to a blank frame that the network just output its learned average for every face (age stuck around 45–48, gender always low-confidence "Male", regardless of who or what was in front of the camera). The fix was simply to stop normalizing manually and let the model's own `Rescaling` layer do it, since that's exactly how `scripts/train.py` / the notebook feed images during training.
 
 **Detector jitter (mitigated in software):** `cv2.CascadeClassifier` keeps no temporal state and returns no confidence score, so raw per-frame output double-counts faces and swings years of age between consecutive frames. `detection_utils.py` corrects this at inference rather than by retraining; measured before/after is in [Prediction stability](#prediction-stability).
+
+**The app is not the notebook (measured, not yet settled):** the notebook's metrics describe the
+model on ideal crops; the app adds a Haar box and a resize on top. `scripts/eval_pipeline.py`
+prints the gap for your dataset — run it before *and* after changing the detector or the crop
+policy, because "it looks better" is not evidence. Until you have run it, treat
+`--crop-policy square` as an open experiment, not a feature.
 
 **Dataset skew:** UTKFace is skewed toward adult faces; expect lower accuracy on children and the elderly unless you augment with a more balanced dataset.
 

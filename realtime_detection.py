@@ -10,6 +10,7 @@ Usage:
     python realtime_detection.py --debug         # raw + smoothed readout
     python realtime_detection.py --no-smooth     # per-frame values, as they come
     python realtime_detection.py --no-nms        # show every raw Haar box
+    python realtime_detection.py --crop-policy square   # re-frame boxes like the training crops
 
 Press 'q' in the video window to quit.
 """
@@ -19,9 +20,16 @@ import os
 
 import cv2
 import numpy as np
-from tensorflow.keras.models import load_model
 
-from detection_utils import FaceTracker, format_label, non_max_suppression
+from detection_utils import (
+    DEFAULT_CROP_SCALE,
+    DEFAULT_CROP_Y_SHIFT,
+    FaceTracker,
+    describe_crop_policy,
+    face_crops,
+    format_label,
+    non_max_suppression,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "age_gender_custom_cnn_v1.keras")
@@ -67,6 +75,22 @@ def parse_args():
              "to a slower reader; 'dshow' often stops that at the source",
     )
     parser.add_argument(
+        "--crop-policy", choices=("haar", "square"), default="haar",
+        help="'haar' feeds the raw detectMultiScale box (historical behaviour, still the "
+             "default). 'square' re-frames the box to match the square UTKFace crops the "
+             "network was trained on. Run scripts/eval_pipeline.py --search before switching "
+             "this over: the two numbers below are a hypothesis, not a measurement.",
+    )
+    parser.add_argument(
+        "--crop-scale", type=float, default=DEFAULT_CROP_SCALE,
+        help="side of the square crop as a multiple of max(box w, h) (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--crop-y-shift", type=float, default=DEFAULT_CROP_Y_SHIFT,
+        help="vertical shift of the square crop as a fraction of box height; negative moves it "
+             "up, i.e. includes more forehead (default: %(default)s)",
+    )
+    parser.add_argument(
         "--no-skip-dupes", action="store_true",
         help="run inference on every read, even when the camera handed back an identical frame",
     )
@@ -75,6 +99,11 @@ def parse_args():
 
 def load_model_and_cascade():
     """Loads the CNN and the face detector. Paths resolve next to this file, not the cwd."""
+    # Imported here rather than at module scope so that tests of the crop policy,
+    # the frame gate and the CLI can run without TensorFlow installed. Nothing
+    # else in this module needs it: inference takes `model` as an argument.
+    from tensorflow.keras.models import load_model
+
     if not os.path.isfile(MODEL_PATH):
         raise SystemExit(
             f"Model file not found: {MODEL_PATH}\n"
@@ -112,19 +141,34 @@ def _feed(model, batch):
     return batch
 
 
-def predict_faces(model, gray, faces):
+def make_crops(gray, faces, policy="haar", scale=DEFAULT_CROP_SCALE, y_shift=DEFAULT_CROP_Y_SHIFT):
     """
-    Runs one batched forward pass for every face in the frame.
+    Turns detected boxes into a (N, IMG_SIZE, IMG_SIZE, 1) float32 batch.
 
-    Returns (gender_scores, ages) as 1-D float arrays aligned with `faces`.
+    Split from the forward pass so an offline evaluation can stack crops from
+    many images into one large batch and still run the exact function the webcam
+    uses. That split is also what makes --search affordable: detection runs once
+    per image and every candidate crop policy only re-crops.
+
+    The crops carry RAW 0-255 pixels; the model's own Rescaling(1/255) layer
+    normalizes them, and dividing here as well collapses every prediction to the
+    dataset mean.
     """
-    crops = np.stack(
-        [cv2.resize(gray[y : y + h, x : x + w], (IMG_SIZE, IMG_SIZE)).astype("float32") for (x, y, w, h) in faces]
-    )
-    crops = np.expand_dims(crops, axis=-1)  # (N, 128, 128, 1)
+    crops = [
+        cv2.resize(c, (IMG_SIZE, IMG_SIZE)).astype("float32")
+        for c in face_crops(gray, faces, policy=policy, scale=scale, y_shift=y_shift)
+    ]
+    if not crops:
+        return np.zeros((0, IMG_SIZE, IMG_SIZE, 1), dtype="float32")
+    return np.expand_dims(np.stack(crops), axis=-1)  # (N, 128, 128, 1)
 
-    # Feed RAW 0-255 pixels. The model's own Rescaling(1/255) layer normalizes;
-    # dividing here too collapses every prediction to the dataset mean.
+
+def run_inference(model, crops):
+    """
+    One forward pass over a prepared crop batch, returning (gender_scores, ages).
+    """
+    if len(crops) == 0:
+        return np.zeros((0,), dtype="float32"), np.zeros((0,), dtype="float32")
 
     try:
         # Direct call is much cheaper per frame than predict(), which rebuilds
@@ -135,6 +179,16 @@ def predict_faces(model, gray, faces):
         gender_pred, age_pred = model.predict(_feed(model, crops), verbose=0)
 
     return np.asarray(gender_pred).reshape(-1), np.asarray(age_pred).reshape(-1)
+
+
+def predict_faces(model, gray, faces, policy="haar", scale=DEFAULT_CROP_SCALE,
+                  y_shift=DEFAULT_CROP_Y_SHIFT):
+    """
+    Runs one batched forward pass for every face in the frame.
+
+    Returns (gender_scores, ages) as 1-D float arrays aligned with `faces`.
+    """
+    return run_inference(model, make_crops(gray, faces, policy=policy, scale=scale, y_shift=y_shift))
 
 
 _STRIDE = 8
@@ -214,7 +268,10 @@ def analyze_frame(model, face_cascade, tracker, frame, args):
     if len(faces) == 0:
         return []
 
-    gender_scores, ages = predict_faces(model, gray, faces)
+    gender_scores, ages = predict_faces(
+        model, gray, faces,
+        policy=args.crop_policy, scale=args.crop_scale, y_shift=args.crop_y_shift,
+    )
     rows = tracker.update(faces, gender_scores, ages)
 
     for row in rows:
@@ -266,6 +323,9 @@ def main():
         print(
             f"Smoothing window: {tracker.window} frame(s) | gender hysteresis: +/-{tracker.gender_margin:.2f}"
             f" | duplicate-box merging: {'off' if args.no_nms else f'IoU {args.nms_iou:.2f}'}"
+        )
+        print(
+            f"            Crop policy: {describe_crop_policy(args.crop_policy, args.crop_scale, args.crop_y_shift)}"
         )
 
         gate = FrameGate(enabled=args.skip_dupes)
